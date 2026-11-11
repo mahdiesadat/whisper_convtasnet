@@ -1,5 +1,13 @@
 #!/usr/bin/env python3
-"""p3_artifacts.py (rev 2) -- center | margin | grads, with every review fix applied.
+"""P3 artifact diagnostics -- valid-length consumer patch (runtime validation pending).
+
+Current behavior: all internal auxiliaries are disabled; grads uses out.loss as CE
+and computes the external P3 term on the same graph. Assignment comes from the
+model's stashed CE-PIT index, not CE reconstruction. Masks use explicit lengths.
+The model file is absent from this pack: KEEP_FEATS, CE-only behavior, feature
+layout, and permutation order still require verification on the server.
+
+Historical rev-2 notes below are retained for context, NOT current guarantees.
 
 Fixes vs rev 1
 --------------
@@ -46,9 +54,13 @@ import torch.nn.functional as F
 from transformers import WhisperProcessor
 
 import p3_loss as P3
+import p3_masks2 as MASKS
 from model.modeling_whisper_sidecar import WhisperSidecarForConditionalGeneration
 from utils.data_utils import DataCollatorSpeechSeq2SeqWithPadding
 from utils.dataset import CustomDataset
+
+
+AUDIT_ROWS = []
 
 
 def sha256(path):
@@ -70,7 +82,7 @@ def build(ckpt, device):
     model.to(device)
     coll = DataCollatorSpeechSeq2SeqWithPadding(processor=proc, num_spks=2,
                                                 soft_prompt_len=4, target_asr=False)
-    return proc, model, coll
+    return proc, model, MASKS.LengthCollator(coll)
 
 
 def batches(manifest, proc, coll, n_batches, batch_size, seed=0):
@@ -105,20 +117,37 @@ def forward_common(model, batch, device, need_graph=False):
     enc = model.model.encoder
     st = enc.last_full_streams
     cl = enc.last_clean_feats
-    B, S = st.shape[0] // model.num_spks, model.num_spks
+    if st.ndim != 3 or st.shape[0] != clean.shape[0] * model.num_spks:
+        raise ValueError("stored stream must have shape (B*S,C,T)")
+    B, S = clean.shape[0], model.num_spks
     T = st.shape[-1]
     stream = st.float().view(B, S, st.shape[1], T).permute(0, 1, 3, 2)     # (B,S,T,C)
-    clean_t = cl.float().view(B, S, cl.shape[1], cl.shape[2])
-    # source activity, union and overlap kept SEPARATE (review point 1)
-    src = P3.frame_activity(clean.view(-1, clean.shape[-1]), n_frames=T).view(B, S, T)
-    union = src.any(dim=1)
-    overlap = src.all(dim=1)
-    active = overlap[:, None, :].expand(B, S, T) & src          # P3 mask == overlap
-    # PIT assignment, then validated against the model's own CE
+    if tuple(cl.shape) != (B * S, T, st.shape[1]):
+        raise ValueError(f"clean features must be (B*S,T,C), got {tuple(cl.shape)}")
+    clean_t = cl.float().reshape(B, S, T, st.shape[1])
+    masks = MASKS.masks_from_batch(
+        dict(clean_audios=clean, clean_lengths=batch["clean_lengths"],
+             mix_length=batch["mix_length"]), n_frames=T)
+    src = masks["source_active"]
+    union = masks["union_active"]
+    overlap = masks["overlap_active"]
+    active = overlap[:, None, :].expand(B, S, T)
+    # Actual CE-PIT choice stashed by this forward.
     perms = perms_table(S)
-    idx = pit_argmin(out, labels, model, perms)
-    ce_check = pit_min_value(out, labels, model, perms)
-    asg = P3.assignment_from_pit(perms, idx, S)
+    idx = getattr(enc, "last_loss_min_idx", None)
+    assert idx is not None, "model did not stash last_loss_min_idx -- apply patch_flags.py"
+    asg = P3.assignment_from_pit(perms, idx, S)      # REAL CE-PIT argmin of this forward
+    P3._check_inputs(stream, clean_t, asg, active, None)
+    AUDIT_ROWS.append(dict(
+        stream_shape=list(stream.shape), clean_shape=list(clean_t.shape),
+        mix_length=torch.as_tensor(batch["mix_length"]).tolist(),
+        clean_lengths=torch.as_tensor(batch["clean_lengths"]).tolist(),
+        assignment=asg.detach().cpu().tolist(),
+        counts={k: v.reshape(B, -1).sum(1).cpu().tolist() for k, v in masks.items()},
+        union_only=(union & ~overlap).sum(1).cpu().tolist(),
+        mask_policy="center=union_active; margin/grads=overlap_active",
+        temporal_policy="complete 320-sample intervals from zero; encoder support alignment unproven"))
+    ce_check = None
     return dict(out=out, stream=stream, clean=clean_t, active=active,
                 union=union, overlap=overlap, assignment=asg, src=src,
                 ce_check=ce_check, T=T, B=B, S=S)
@@ -143,7 +172,7 @@ def pit_min_value(out, labels, model, perms):
 
 
 def cmd_center(a):
-    os.environ.setdefault("SIDECAR_P3_BETA", "1")
+    diagnostic_env()
     proc, model, coll = build(a.checkpoint, "cpu")
     model.eval()
     C = model.config.d_model
@@ -184,7 +213,7 @@ def cmd_center(a):
                 depth="Whisper encoder after block index 1 + gated residual (the stream Whisper consumes)",
                 checkpoint=a.checkpoint, train_manifest=a.manifest,
                 frame_grid="1500 frames x 20 ms (320 samples); mel hop 160, stride 2 in the 2nd conv",
-                unverified="frame_activity is an approximation on the feature grid; valid-length, crop/shift alignment and source-vs-mixture offsets are NOT proven here")
+                unverified="Complete 320-sample valid intervals enforced; receptive-field alignment and source-vs-mixture offsets remain unproven")
     (out.with_suffix(".json")).write_text(json.dumps(meta, indent=1))
     print(json.dumps(meta, indent=1))
 
@@ -192,7 +221,7 @@ def cmd_center(a):
 def cmd_margin(a):
     if not (0.0 < a.target_active < 1.0):
         raise SystemExit("--target-active must be in (0,1)")
-    os.environ.setdefault("SIDECAR_P3_BETA", "1")
+    diagnostic_env()
     proc, model, coll = build(a.checkpoint, "cpu")
     model.eval()
     center = torch.load(a.center, map_location="cpu").float()
@@ -228,10 +257,13 @@ def cmd_margin(a):
     print(json.dumps(res, indent=1))
 
 
+def diagnostic_env():
+    os.environ.update(SIDECAR_P3_BETA="0", SIDECAR_SEP_LAM="0",
+                      SIDECAR_REC_LAM="0", SIDECAR_LOAD_CLEAN="1", SIDECAR_KEEP_FEATS="1")
+
+
 def cmd_grads(a):
-    os.environ["SIDECAR_SEP_LAM"] = "0"
-    os.environ["SIDECAR_REC_LAM"] = "0"
-    os.environ["SIDECAR_P3_BETA"] = str(a.beta)      # term ON so the stream is stored
+    diagnostic_env()
     proc, model, coll = build(a.checkpoint, "cpu")
     model.train(a.train_mode)
     center = torch.load(a.center, map_location="cpu").float()
@@ -245,12 +277,9 @@ def cmd_grads(a):
         r = forward_common(model, batch, "cpu", need_graph=True)
         l_aux, stats = P3.p3_margin_loss(r["stream"], r["clean"], r["assignment"],
                                          r["active"], center, margin)
-        l_tot = r["out"].loss
-        l_ce = l_tot - a.beta * l_aux                 # exact graph subtraction
-        note = dict(ce_minus_recon=abs(float(l_ce) - r["ce_check"]),
-                    aux=float(l_aux), ce_est=float(l_ce), total=float(l_tot))
-        if note["ce_minus_recon"] > 1e-4 * max(1.0, abs(r["ce_check"])):
-            print("  WARNING batch %d: CE reconstruction differs from the model (%s)" % (bi, note))
+        l_ce = r["out"].loss  # Internal auxiliaries disabled BEFORE construction.
+        l_tot = l_ce + a.beta * l_aux
+        note = dict(aux=float(l_aux), ce=float(l_ce), total=float(l_tot))
         names = sep + [alpha_name]
         params = [dict(model.named_parameters())[n] for n in names]
         g_ce = torch.autograd.grad(l_ce, params, retain_graph=True, allow_unused=True)
@@ -269,8 +298,11 @@ def cmd_grads(a):
             vs = [gs[k].reshape(-1) for k in keys if k in gs]
             return float(torch.cat(vs).norm()) if vs else 0.0
         def cos_of(keys):
-            a_ = [c[k].reshape(-1) for k in keys if k in c]
-            b_ = [u_[k].reshape(-1) for k in keys if k in u_]
+            common = [k for k in keys if k in c and k in u_]
+            if any(k not in c or k not in u_ for k in keys):
+                return None  # Do not concatenate mismatched parameter coordinates.
+            a_ = [c[k].reshape(-1) for k in common]
+            b_ = [u_[k].reshape(-1) for k in common]
             if not a_ or not b_:
                 return None
             va, vb = torch.cat(a_), torch.cat(b_)
@@ -289,19 +321,22 @@ def cmd_grads(a):
         if alpha_name in c and alpha_name in u_:
             a_ce = float(c[alpha_name].reshape(-1)[0]); a_au = float(u_[alpha_name].reshape(-1)[0])
             row["alpha"].update(r_raw=(abs(a_au) / abs(a_ce)) if a_ce != 0 else None,
-                                cos=float(F.cosine_similarity(c[alpha_name].reshape(-1).unsqueeze(0),
-                                                              u_[alpha_name].reshape(-1).unsqueeze(0))))
+                                cos=(float(F.cosine_similarity(c[alpha_name].reshape(-1).unsqueeze(0),
+                                                               u_[alpha_name].reshape(-1).unsqueeze(0)))
+                                     if a_ce != 0 and a_au != 0 else None))
         rows.append(row)
         print("b%d %s | CE %.4f aux %.5f | sep r_raw %.3f cos %s | d(alpha) ce %.3e aux %.3e"
-              % (bi, row["mode"], note["ce_est"], note["aux"], row["sep"]["r_raw"] or -1,
+              % (bi, row["mode"], note["ce"], note["aux"], row["sep"]["r_raw"] or -1,
                  row["sep"]["cos"], row["alpha"]["ce_grad"] or 0, row["alpha"]["aux_grad"] or 0),
               flush=True)
     out = Path(a.out); out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(json.dumps(dict(rows=rows, beta_applied=a.beta, margin=margin,
+                                   perms=perms_table(),
+                                   sep_param_names=sep, alpha_param_name=alpha_name,
+                                   loss_source="l_ce = out.loss (all internal auxiliaries off), l_aux from the stored stream", 
                                    center=a.center, checkpoint=a.checkpoint,
                                    helper_sha256=sha256(Path(P3.__file__).resolve()),
-                                   assignment_source="reconstructed from out.logits and validated "
-                                                     "against the model's CE (see ce_minus_recon)"),
+                                   assignment_source="encoder.last_loss_min_idx from actual CE-PIT; permutation order requires model review"),
                                 indent=1))
     print("wrote", out)
 
@@ -334,7 +369,25 @@ def main():
     g.add_argument("--train-mode", action="store_true")
     g.set_defaults(fn=cmd_grads)
     a = ap.parse_args()
+    if a.n_batches <= 0 or a.batch_size <= 0:
+        ap.error("n-batches and batch-size must be positive")
     a.fn(a)
+    modules = [P3, MASKS, sys.modules[CustomDataset.__module__],
+               sys.modules[DataCollatorSpeechSeq2SeqWithPadding.__module__],
+               sys.modules[WhisperSidecarForConditionalGeneration.__module__]]
+    files = [Path(__file__).resolve()] + [Path(m.__file__).resolve() for m in modules]
+    provenance = dict(command={k: v for k, v in vars(a).items() if k != "fn"},
+                      manifest_sha256=sha256(a.manifest),
+                      code=[dict(path=str(p), sha256=sha256(p)) for p in files],
+                      environment={k: v for k, v in os.environ.items()
+                                   if k.startswith("SIDECAR_") or k == "P3_CODE_ROOT"},
+                      batches=AUDIT_ROWS,
+                      training_wiring_verified=False)
+    path = Path(str(a.out) + ".provenance.json")
+    path.write_text(json.dumps(provenance, indent=2, allow_nan=False))
+    if json.loads(path.read_text()) != provenance:
+        raise RuntimeError("provenance JSON roundtrip failed")
+    print("wrote and reread", path)
 
 
 if __name__ == "__main__":
