@@ -1,0 +1,15 @@
+﻿*.safetensors
+*.bin
+*.pt
+*.ckpt
+*.pth
+checkpoint-*/
+dataset/
+raw/
+*.wav
+*.flac
+__pycache__/
+*.pyc
+.venv/
+outputs/
+logs/
